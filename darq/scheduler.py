@@ -3,15 +3,13 @@ import logging
 import typing as t
 from datetime import datetime
 
-from .connections import create_pool
-from .connections import RedisSettings
+from .connections import RedisSettings, create_pool
 from .types import AnyDict
-from .utils import poll
-from .utils import to_seconds_strict
-from .utils import to_unix_ms
+from .utils import poll, to_seconds_strict, to_unix_ms
 
 if t.TYPE_CHECKING:  # pragma: no cover
     from darq import Darq
+
     from .connections import ArqRedis
 
 log = logging.getLogger('darq.scheduler')
@@ -24,8 +22,9 @@ class Scheduler:
 
     def __init__(self, app: 'Darq') -> None:
         self.cron_jobs = app.cron_jobs
-        assert self.cron_jobs and len(self.cron_jobs) > 0, \
+        assert self.cron_jobs and len(self.cron_jobs) > 0, (
             'at least one cron_job must be registered'
+        )
 
         settings = app.worker_settings
         self.app = app
@@ -38,22 +37,28 @@ class Scheduler:
         self.redis_settings = app.redis_settings or RedisSettings()
 
         self.main_task: t.Optional[asyncio.Task[None]] = None
-        self.loop = asyncio.get_event_loop()
+        self.loop = None
         self.scheduler_ctx: AnyDict = {}
 
-    def run(self) -> None:
+    async def _run(self) -> None:
         """
         Sync function to run the scheduler,
         finally closes scheduler connections.
         """
-        self.main_task = self.loop.create_task(self.main())
+        if self.loop is None:
+            self.loop = asyncio.get_event_loop()
+
+        self.main_task = asyncio.create_task(self.main())
         try:
-            self.loop.run_until_complete(self.main_task)
+            await self.main_task
         except asyncio.CancelledError:  # pragma: no cover
             # happens on shutdown, fine
             pass
         finally:
-            self.loop.run_until_complete(self.close())
+            await self.close()
+
+    def run(self):
+        asyncio.run(self._run())
 
     async def async_run(self) -> None:
         """
@@ -66,7 +71,8 @@ class Scheduler:
     async def main(self) -> None:
         log.info(
             'Starting cron scheduler for %d cron jobs: \n%s',
-            len(self.cron_jobs), '\n'.join(str(cj) for cj in self.cron_jobs),
+            len(self.cron_jobs),
+            '\n'.join(str(cj) for cj in self.cron_jobs),
         )
         self.pool = await create_pool(self.redis_settings)
         self.scheduler_ctx['redis'] = self.pool
@@ -100,11 +106,14 @@ class Scheduler:
                 )
                 log.info(
                     'Scheduler: Sending due task %s (%s)',
-                    cron_job.name, job_id,
+                    cron_job.name,
+                    job_id,
                 )
-                job_futures.add(cron_job.task.apply_async(
-                    job_id=job_id,
-                ))
+                job_futures.add(
+                    cron_job.task.apply_async(
+                        job_id=job_id,
+                    )
+                )
                 cron_job.set_next(n)
 
         job_futures and await asyncio.gather(*job_futures)

@@ -11,34 +11,39 @@ from time import time
 import async_timeout
 from aioredis import MultiExecError
 
-from .connections import create_pool
-from .connections import log_redis_info
-from .connections import RedisSettings
-from .constants import default_queue_name
-from .constants import health_check_key_suffix
-from .constants import in_progress_key_prefix
-from .constants import job_key_prefix
-from .constants import result_key_prefix
-from .constants import retry_key_prefix
-from .jobs import deserialize_job_raw
-from .jobs import Deserializer
-from .jobs import JobResult
-from .jobs import SerializationError
-from .jobs import serialize_result
-from .jobs import Serializer
+from .connections import RedisSettings, create_pool, log_redis_info
+from .constants import (
+    default_queue_name,
+    health_check_key_suffix,
+    in_progress_key_prefix,
+    job_key_prefix,
+    result_key_prefix,
+    retry_key_prefix,
+)
+from .jobs import (
+    Deserializer,
+    JobResult,
+    SerializationError,
+    Serializer,
+    deserialize_job_raw,
+    serialize_result,
+)
 from .types import CoroutineType
-from .utils import args_to_string
-from .utils import ms_to_datetime
-from .utils import poll
-from .utils import SecondsTimedelta
-from .utils import timestamp_ms
-from .utils import to_ms
-from .utils import to_seconds
-from .utils import to_seconds_strict
-from .utils import truncate
+from .utils import (
+    SecondsTimedelta,
+    args_to_string,
+    ms_to_datetime,
+    poll,
+    timestamp_ms,
+    to_ms,
+    to_seconds,
+    to_seconds_strict,
+    truncate,
+)
 
 if t.TYPE_CHECKING:  # pragma: no cover
     from darq import Darq
+
     from .connections import ArqRedis
 
 log = logging.getLogger('darq.worker')
@@ -66,8 +71,11 @@ class Task(t.NamedTuple):
         with_ctx: bool = False,
     ) -> 'Task':
         return cls(
-            name=name, coroutine=coroutine, timeout_s=to_seconds(timeout),
-            keep_result_s=to_seconds(keep_result), max_tries=max_tries,
+            name=name,
+            coroutine=coroutine,
+            timeout_s=to_seconds(timeout),
+            keep_result_s=to_seconds(keep_result),
+            max_tries=max_tries,
             with_ctx=with_ctx,
         )
 
@@ -106,9 +114,8 @@ class FailedJobs(RuntimeError):
             exc = self.job_results[0].result
             return f'1 job failed {exc!r}'
         else:
-            return (
-                f'{self.count} jobs failed:\n'
-                + '\n'.join(repr(r.result) for r in self.job_results)
+            return f'{self.count} jobs failed:\n' + '\n'.join(
+                repr(r.result) for r in self.job_results
             )
 
     def __repr__(self) -> str:
@@ -140,6 +147,7 @@ class WorkerSettings:
     :param job_deserializer: a function that deserializes bytes into Python
                              objects, defaults to pickle.loads
     """
+
     queue_name: str = default_queue_name
     burst: bool = False
     max_jobs: int = 10
@@ -165,15 +173,16 @@ class Worker:
     """
 
     def __init__(
-            self, app: 'Darq', **replace_kwargs: t.Dict[str, t.Any],
+        self,
+        app: 'Darq',
+        **replace_kwargs: t.Dict[str, t.Any],
     ) -> None:
         settings = dataclasses.replace(app.worker_settings, **replace_kwargs)
         self.app = app
         self.functions: t.Dict[str, Task] = dict(app.registry)
         self.queue_name = settings.queue_name
 
-        assert len(self.functions) > 0, \
-            'at least one function or cron_job must be registered'
+        assert len(self.functions) > 0, 'at least one function or cron_job must be registered'
         self.burst = settings.burst
         self.on_startup = app.on_startup
         self.on_shutdown = app.on_shutdown
@@ -183,9 +192,7 @@ class Worker:
         self.job_timeout_s = to_seconds_strict(settings.job_timeout)
         self.keep_result_s = to_seconds_strict(settings.keep_result)
         self.poll_delay_s = to_seconds_strict(settings.poll_delay)
-        self.queue_read_limit = (
-            settings.queue_read_limit or settings.max_jobs
-        )
+        self.queue_read_limit = settings.queue_read_limit or settings.max_jobs
         self._queue_read_offset = 0
         self.max_tries = settings.max_tries
         self.health_check_interval = to_seconds_strict(
@@ -203,19 +210,15 @@ class Worker:
         self.main_task: t.Optional[asyncio.Task[None]] = None
         self.graceful_shutdown_task: t.Optional[asyncio.Task[None]] = None
         self.graceful_shutdown_timeout = 30
-        self.loop = asyncio.get_event_loop()
+        self.loop = None
         self.ctx = app.ctx or {}
-        max_timeout = max(
-            f.timeout_s or self.job_timeout_s for f in self.functions.values()
-        )
+        max_timeout = max(f.timeout_s or self.job_timeout_s for f in self.functions.values())
         self.in_progress_timeout_s = max_timeout + 10
         self.jobs_complete = 0
         self.jobs_retried = 0
         self.jobs_failed = 0
         self._last_health_check: float = 0
         self._last_health_check_log: t.Optional[str] = None
-        self._add_signal_handler(signal.SIGINT, self.handle_sig)
-        self._add_signal_handler(signal.SIGTERM, self.handle_sig)
         self.on_stop: t.Optional[t.Callable[[Signals], None]] = None
         # whether or not to retry jobs on Retry and CancelledError
         self.retry_jobs = settings.retry_jobs
@@ -223,18 +226,26 @@ class Worker:
         self.job_serializer = settings.job_serializer
         self.job_deserializer = settings.job_deserializer
 
-    def run(self) -> None:
+    async def _run(self) -> None:
         """
         Sync function to run the worker, finally closes worker connections.
         """
-        self.main_task = self.loop.create_task(self.main())
+        if self.loop is None:
+            self.loop = asyncio.get_running_loop()
+            self._add_signal_handler(signal.SIGINT, self.handle_sig)
+            self._add_signal_handler(signal.SIGTERM, self.handle_sig)
+
+        self.main_task = asyncio.create_task(self.main())
         try:
-            self.loop.run_until_complete(self.main_task)
+            await self.main_task
         except asyncio.CancelledError:  # pragma: no cover
             # happens on shutdown, fine
             pass
         finally:
-            self.loop.run_until_complete(self.close())
+            await self.close()
+
+    def run(self) -> None:
+        asyncio.run(self._run())
 
     async def async_run(self) -> None:
         """
@@ -245,9 +256,9 @@ class Worker:
         await self.main_task
 
     async def run_check(
-            self,
-            retry_jobs: t.Optional[bool] = None,
-            max_burst_jobs: t.Optional[int] = None,
+        self,
+        retry_jobs: t.Optional[bool] = None,
+        max_burst_jobs: t.Optional[int] = None,
     ) -> int:
         """
         Run :func:`darq.worker.Worker.async_run`, check for failed jobs
@@ -262,8 +273,7 @@ class Worker:
         await self.async_run()
         if self.jobs_failed:
             failed_job_results = [
-                r for r in await self.pool.all_job_results()
-                if not r.success
+                r for r in await self.pool.all_job_results() if not r.success
             ]
             raise FailedJobs(self.jobs_failed, failed_job_results)
         else:
@@ -272,7 +282,8 @@ class Worker:
     async def main(self) -> None:
         log.info(
             'Starting worker for %d functions: %s',
-            len(self.functions), ', '.join(self.functions),
+            len(self.functions),
+            ', '.join(self.functions),
         )
         self.pool = await create_pool(self.redis_settings)
         await log_redis_info(self.pool, log.info)
@@ -310,8 +321,10 @@ class Worker:
             # to run the jobs
             now = timestamp_ms()
             job_ids = await self.pool.zrangebyscore(
-                self.queue_name, offset=self._queue_read_offset,
-                count=count, max=now,
+                self.queue_name,
+                offset=self._queue_read_offset,
+                count=count,
+                max=now,
             )
         await self.run_jobs(job_ids)
         self.clean_tasks_done()
@@ -395,7 +408,11 @@ class Worker:
 
         try:
             (
-                function_name, args, kwargs, enqueue_job_try, enqueue_time_ms,
+                function_name,
+                args,
+                kwargs,
+                enqueue_job_try,
+                enqueue_time_ms,
             ) = deserialize_job_raw(v, deserializer=self.job_deserializer)
         except SerializationError as e:
             log.exception('deserializing job %s failed', job_id)
@@ -416,18 +433,18 @@ class Worker:
         if enqueue_job_try and enqueue_job_try > job_try:
             job_try = enqueue_job_try
             await self.pool.setex(
-                retry_key_prefix + job_id, 88400, str(job_try),
+                retry_key_prefix + job_id,
+                88400,
+                str(job_try),
             )
 
-        max_tries = (
-            self.max_tries
-            if function.max_tries is None
-            else function.max_tries
-        )
+        max_tries = self.max_tries if function.max_tries is None else function.max_tries
         if job_try > max_tries:
             log.warning(
                 '%6.2fs ! %s max retries %d exceeded',
-                (timestamp_ms() - enqueue_time_ms) / 1000, ref, max_tries,
+                (timestamp_ms() - enqueue_time_ms) / 1000,
+                ref,
+                max_tries,
             )
             self.jobs_failed += 1
             result_data = serialize_result(
@@ -448,11 +465,7 @@ class Worker:
         result = no_result
         exc_extra = None
         finish = False
-        timeout_s = (
-            self.job_timeout_s
-            if function.timeout_s is None
-            else function.timeout_s
-        )
+        timeout_s = self.job_timeout_s if function.timeout_s is None else function.timeout_s
         incr_score: t.Optional[float] = None
         job_ctx = {
             'job_id': job_id,
@@ -474,7 +487,10 @@ class Worker:
                 extra += f' delayed={(start_ms - score) / 1000:0.2f}s'
             log.info(
                 '%6.2fs → %s(%s)%s',
-                (start_ms - enqueue_time_ms) / 1000, ref, s, extra,
+                (start_ms - enqueue_time_ms) / 1000,
+                ref,
+                s,
+                extra,
             )
 
             coro = function.coroutine
@@ -500,7 +516,9 @@ class Worker:
                 incr_score = e.defer_score
                 log.info(
                     '%6.2fs ↻ %s retrying job in %0.2fs',
-                    t_, ref, (e.defer_score or 0) / 1000,
+                    t_,
+                    ref,
+                    (e.defer_score or 0) / 1000,
                 )
                 if e.defer_score:
                     incr_score = e.defer_score + (timestamp_ms() - score)
@@ -511,7 +529,10 @@ class Worker:
             else:
                 log.exception(
                     '%6.2fs ! %s failed, %s: %s',
-                    t_, ref, e.__class__.__name__, e,
+                    t_,
+                    ref,
+                    e.__class__.__name__,
+                    e,
                     extra={'extra': exc_extra},
                 )
                 result = e
@@ -522,15 +543,15 @@ class Worker:
             finished_ms = timestamp_ms()
             log.info(
                 '%6.2fs ← %s ● %s',
-                (finished_ms - start_ms) / 1000, ref, result_str,
+                (finished_ms - start_ms) / 1000,
+                ref,
+                result_str,
             )
             finish = True
             self.jobs_complete += 1
 
         result_timeout_s = (
-            self.keep_result_s
-            if function.keep_result_s is None
-            else function.keep_result_s
+            self.keep_result_s if function.keep_result_s is None else function.keep_result_s
         )
         result_data = None
         if result is not no_result and result_timeout_s > 0:
@@ -548,15 +569,25 @@ class Worker:
                 serializer=self.job_serializer,
             )
 
-        await asyncio.shield(self.finish_job(
-            job_id, finish, result_data, result_timeout_s, incr_score,
-        ))
+        await asyncio.shield(
+            self.finish_job(
+                job_id,
+                finish,
+                result_data,
+                result_timeout_s,
+                incr_score,
+            )
+        )
         if self.on_job_postrun:
             await self.on_job_postrun(ctx, function, args, kwargs, result)
 
     async def finish_job(
-            self, job_id: str, finish: bool, result_data: t.Optional[bytes],
-            result_timeout_s: t.Optional[float], incr_score: t.Optional[float],
+        self,
+        job_id: str,
+        finish: bool,
+        result_data: t.Optional[bytes],
+        result_timeout_s: t.Optional[float],
+        incr_score: t.Optional[float],
     ) -> None:
         with await self.pool as conn:
             await conn.unwatch()
@@ -565,11 +596,13 @@ class Worker:
             if finish:
                 if result_data:
                     tr.setex(
-                        result_key_prefix + job_id, result_timeout_s,
+                        result_key_prefix + job_id,
+                        result_timeout_s,
                         result_data,
                     )
                 delete_keys += [
-                    retry_key_prefix + job_id, job_key_prefix + job_id,
+                    retry_key_prefix + job_id,
+                    job_key_prefix + job_id,
                 ]
                 tr.zrem(self.queue_name, job_id)
             elif incr_score:
@@ -578,7 +611,9 @@ class Worker:
             await tr.execute()
 
     async def abort_job(
-            self, job_id: str, result_data: t.Optional[bytes],
+        self,
+        job_id: str,
+        result_data: t.Optional[bytes],
     ) -> None:
         with await self.pool as conn:
             await conn.unwatch()
@@ -590,12 +625,11 @@ class Worker:
             )
             tr.zrem(self.queue_name, job_id)
             # result_data would only be None if serializing the result fails
-            if (
-                    result_data is not None
-                    and self.keep_result_s > 0
-            ):  # pragma: no branch
+            if result_data is not None and self.keep_result_s > 0:  # pragma: no branch
                 tr.setex(
-                    result_key_prefix + job_id, self.keep_result_s, result_data,
+                    result_key_prefix + job_id,
+                    self.keep_result_s,
+                    result_data,
                 )
             await tr.execute()
 
@@ -619,28 +653,22 @@ class Worker:
             self.health_check_interval + 1,
             info.encode(),
         )
-        log_suffix = info[info.index('j_complete='):]
-        if (
-                self._last_health_check_log
-                and log_suffix != self._last_health_check_log
-        ):
+        log_suffix = info[info.index('j_complete=') :]
+        if self._last_health_check_log and log_suffix != self._last_health_check_log:
             log.info('recording health: %s', info)
             self._last_health_check_log = log_suffix
         elif not self._last_health_check_log:
             self._last_health_check_log = log_suffix
 
     def _add_signal_handler(
-            self, signal: signal.Signals, handler: t.Callable[[int], None],
+        self,
+        signal: signal.Signals,
+        handler: t.Callable[[int], None],
     ) -> None:
         self.loop.add_signal_handler(signal, partial(handler, signal))
 
     def _jobs_started(self) -> int:
-        return (
-            self.jobs_complete
-            + self.jobs_retried
-            + self.jobs_failed
-            + len(self.tasks)
-        )
+        return self.jobs_complete + self.jobs_retried + self.jobs_failed + len(self.tasks)
 
     def running_job_count(self) -> int:
         return sum(not task.done() for task in self.tasks)
@@ -650,7 +678,8 @@ class Worker:
         if running_job_count:
             log.info(
                 'Warm shutdown. Awaiting for %d jobs with %d seconds timeout.',
-                running_job_count, self.graceful_shutdown_timeout,
+                running_job_count,
+                self.graceful_shutdown_timeout,
             )
             async for _ in poll(0.1, timeout=self.graceful_shutdown_timeout):
                 if not self.running_job_count():
@@ -704,9 +733,9 @@ class Worker:
 
 
 async def async_check_health(
-        redis_settings: t.Optional[RedisSettings],
-        health_check_key: t.Optional[str] = None,
-        queue: t.Optional[str] = None,
+    redis_settings: t.Optional[RedisSettings],
+    health_check_key: t.Optional[str] = None,
+    queue: t.Optional[str] = None,
 ) -> int:
     redis_settings = redis_settings or RedisSettings()
     redis = await create_pool(redis_settings)
@@ -733,19 +762,23 @@ def check_health(darq: 'Darq', queue: str) -> int:
     loop = asyncio.get_event_loop()
     return loop.run_until_complete(
         async_check_health(
-            darq.redis_settings, darq.worker_settings.health_check_key, queue,
+            darq.redis_settings,
+            darq.worker_settings.health_check_key,
+            queue,
         ),
     )
 
 
 def create_worker(
-        darq: 'Darq', **overwrite_settings: t.Dict[str, t.Any],
+    darq: 'Darq',
+    **overwrite_settings: t.Dict[str, t.Any],
 ) -> Worker:
     return Worker(darq, **overwrite_settings)
 
 
 def run_worker(
-        darq: 'Darq', **overwrite_settings: t.Dict[str, t.Any],
+    darq: 'Darq',
+    **overwrite_settings: t.Dict[str, t.Any],
 ) -> Worker:
     worker = create_worker(darq, **overwrite_settings)
     worker.run()
